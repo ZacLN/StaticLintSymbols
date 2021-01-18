@@ -1,61 +1,8 @@
 module StaticLintSymbols
 using CSTParser, StaticLint, SymbolServer
 using CSTParser: EXPR, headof, valof
-using StaticLint: haserror, LintCodeDescriptions, collect_hints, scopeof, parentof, Binding, Scope
-using SymbolServer: VarRef, ModuleStore, FunctionStore, MethodStore, DataTypeStore, GenericStore, FakeTypeName
-function setup_server(env = dirname(SymbolServer.Pkg.Types.Context().env.project_file), depot = first(SymbolServer.Pkg.depots()), cache = joinpath(dirname(pathof(SymbolServer)), "..", "store"))
-    server = StaticLint.FileServer()
-    ssi = SymbolServerInstance(depot, cache)
-    _, server.symbolserver = SymbolServer.getstore(ssi, env)
-    server.symbol_extends  = SymbolServer.collect_extended_methods(server.symbolserver)
-    server
-end
-
-"""
-    lint_string(s, server; gethints = false)
-Parse a string and run a semantic pass over it. This will mark scopes, bindings,
-references, and lint hints. An annotated `EXPR` is returned or, if `gethints = true`,
-it is paired with a collected list of errors/hints.
-"""
-function lint_string(s::String, server = setup_server(); gethints = false)
-    empty!(server.files)
-    f = StaticLint.File("", s, CSTParser.parse(s, true), nothing, server)
-    StaticLint.setroot(f, f)
-    StaticLint.setfile(server, "", f)
-    StaticLint.semantic_pass(f)
-    StaticLint.check_all(f.cst, StaticLint.LintOptions(), server)
-    if gethints
-        return f.cst, [(x, string(haserror(x) ? LintCodeDescriptions[x.meta.error] : "Missing reference", " at offset ", offset)) for (offset, x) in collect_hints(f.cst, server)]
-    else
-        return f.cst
-    end
-end
-
-"""
-    lint_file(rootpath, server)
-Read a file from disc, parse and run a semantic pass over it. The file should be the 
-root of a project, e.g. for this package that file is `src/StaticLint.jl`. Other files
-in the project will be loaded automatically (calls to `include` with complicated arguments
-are not handled, see `followinclude` for details). A `FileServer` will be returned 
-containing the `File`s of the package.
-"""
-function lint_file(rootpath, server = setup_server(); gethints = false)
-    empty!(server.files)
-    root = StaticLint.loadfile(server, rootpath)
-    StaticLint.semantic_pass(root)
-    for (p,f) in server.files
-        StaticLint.check_all(f.cst, StaticLint.LintOptions(), server)
-    end
-    if gethints
-        hints = []
-        for (p,f) in server.files
-            append!(hints, [(x, string(haserror(x) ? LintCodeDescriptions[x.meta.error] : "Missing reference", " at offset ", offset, " of ", p)) for (offset, x) in collect_hints(f.cst, server)])
-        end
-        return root, hints
-    else
-        return root
-    end
-end
+using StaticLint: haserror, LintCodeDescriptions, collect_hints, scopeof, parentof, Binding, Scope, lint_file
+using SymbolServer: VarRef, ModuleStore, FunctionStore, MethodStore, DataTypeStore, GenericStore, FakeTypeName, FakeTypeofBottom, FakeTypeofVararg, FakeTypeVar, FakeUnion, FakeUnionAll
 
 # From StaticLint, modififed.
 function scope_exports(scope::Scope, name::String)
@@ -79,7 +26,7 @@ function symbols(pkg_dir::String, server = StaticLint.FileServer())
         CSTParser.defines_module(scopeof(root.cst).names[pkg_name].val)) || 
         @info "No matching module found in $rootpath"
     
-    rootstore = symbols(scopeof(root.cst).names[pkg_name].val)
+    rootstore = symbols(scopeof(root.cst).names[pkg_name].val, server)
     rootstore
 end
 
@@ -87,7 +34,39 @@ function get_docs(x::EXPR)
     ""
 end
 
-function symbols(expr, server, pkg_name = CSTParser.get_name(expr).val, rootstore = ModuleStore(VarRef(nothing, Symbol(pkg_name)), Dict(), "", true, [], []))
+function count_lines(str, offset)
+    cus = codeunits(str)
+    i, cnt = 1, 1
+    while i <= offset
+        if cus[i] == 0x0a
+            cnt += 1
+        end
+        i += 1 
+    end
+    cnt
+end
+
+function get_filename_line(x, server, offset = 0)
+    if parentof(x) isa EXPR
+        for a in parentof(x)
+            x == a && return get_filename_line(parentof(x), server, offset)
+            offset += a.fullspan
+        end
+    elseif headof(x) === :file
+        for (p, f) in server.files
+            if f.cst == x
+                return p, count_lines(f.source, offset)
+            end
+        end
+        @info "Couldn't find filename"
+        return "", 0
+    else
+        @info "Couldn't find :file parent"
+        return "", 0
+    end
+end
+
+function symbols(expr::EXPR, server, pkg_name = CSTParser.get_name(expr).val, rootstore = ModuleStore(VarRef(nothing, Symbol(pkg_name)), Dict(), "", true, [], []))
     rootmodulescope = scopeof(expr)
     for (n, v) in rootmodulescope.names
         # .used modules
@@ -102,7 +81,7 @@ function symbols(expr, server, pkg_name = CSTParser.get_name(expr).val, rootstor
                     else
                         rootstore[Symbol(n)] = symbols(v.val, server, n, ModuleStore(VarRef(rootstore.name, Symbol(name)), Dict(), get_docs(v.val), true, [], []))
                     end
-                elseif v.type == StaticLint.CoreTypes.Function
+                elseif v.type == StaticLint.CoreTypes.Function || v.type == StaticLint.CoreTypes.DataType
                     root_method = StaticLint.get_root_method(v, server)
                     if root_method isa Binding
                         if root_method.val isa EXPR
@@ -110,20 +89,16 @@ function symbols(expr, server, pkg_name = CSTParser.get_name(expr).val, rootstor
                             extends = fname
                             methods = MethodStore[]
                             docs = get_docs(v.val)
-                            while root_method isa Binding
-                                file = ""
-                                line = 0
-                                sig = []
-                                kws = Symbol[]
-                                docs1 = get_docs(root_method.val)
-                                if !isempty(docs1)
-                                    docs = string(docs, "\n", docs1)
-                                end
-                                rt =VarRef(VarRef(nothing, :Core), :Any)
-                                push!(methods, MethodStore(fname.name, rootstore.name.name, file, line, sig, kws, rt))
-                                root_method = root_method.next
+                            get_methods(root_method, docs, fname, rootstore, methods, server)
+                            if v.type == StaticLint.CoreTypes.DataType
+                                name = FakeTypeName(fname, [])
+                                super = FakeTypeName(VarRef(VarRef(nothing, :Core), :Any), [])
+                                types = []
+                                parameters, fieldnames = get_datatype_params_fieldnames(v.val)
+                                rootstore[Symbol(n)] = DataTypeStore(name, super, parameters, types, fieldnames, methods, docs, scope_exports(rootmodulescope, n))
+                            else
+                                rootstore[Symbol(n)] = FunctionStore(fname, methods, docs, extends, scope_exports(rootmodulescope, n))
                             end
-                            rootstore[Symbol(n)] = FunctionStore(fname, [], docs, extends, scope_exports(rootmodulescope, n))
                         else
                             @info "root_method.val isn't an EXPR"
                         end
@@ -137,6 +112,45 @@ function symbols(expr, server, pkg_name = CSTParser.get_name(expr).val, rootstor
         end
     end
     rootstore
+end
+
+function get_methods(root_method, docs, fname, rootstore, methods, server)
+    while root_method isa Binding
+        file, line = get_filename_line(root_method.val, server)
+        
+        sig = []
+        kws = Symbol[]
+        docs1 = get_docs(root_method.val)
+        if !isempty(docs1)
+            docs = string(docs, "\n", docs1)
+        end
+        rt =VarRef(VarRef(nothing, :Core), :Any)
+        push!(methods, MethodStore(fname.name, rootstore.name.name, file, line, sig, kws, rt))
+        root_method = root_method.next
+    end
+    docs, methods
+end
+
+function get_typevar_bounds(x::EXPR)
+    # Just assumes `z <: Any` for now
+    lb = FakeTypeofBottom()
+    ub = FakeTypeName(VarRef(VarRef(nothing, :Core), :Any), [])
+    return lb, ub
+end
+
+function get_datatype_params_fieldnames(x::EXPR)
+    sig = CSTParser.get_sig(x)
+    params = []
+    fns = []
+    for (n, b) in scopeof(x).names
+        if StaticLint.is_in_fexpr(b.val, x-> x == sig)
+            lb, ub = get_typevar_bounds(b.val)
+            push!(params, FakeTypeVar(Symbol(n), lb, ub))
+        else
+            push!(fns, Symbol(n))
+        end
+    end
+    params, fns
 end
 
 end # module
