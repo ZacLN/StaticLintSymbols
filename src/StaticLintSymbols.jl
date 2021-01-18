@@ -1,7 +1,7 @@
 module StaticLintSymbols
 using CSTParser, StaticLint, SymbolServer
 using CSTParser: EXPR, headof, valof
-using StaticLint: haserror, LintCodeDescriptions, collect_hints, scopeof, parentof, Binding, Scope, lint_file
+using StaticLint: haserror, LintCodeDescriptions, collect_hints, scopeof, parentof, Binding, Scope, lint_file, bindingof, hasbinding
 using SymbolServer: VarRef, ModuleStore, FunctionStore, MethodStore, DataTypeStore, GenericStore, FakeTypeName, FakeTypeofBottom, FakeTypeofVararg, FakeTypeVar, FakeUnion, FakeUnionAll
 
 # From StaticLint, modififed.
@@ -118,8 +118,7 @@ function get_methods(root_method, docs, fname, rootstore, methods, server)
     while root_method isa Binding
         file, line = get_filename_line(root_method.val, server)
         
-        sig = []
-        kws = Symbol[]
+        sig, kws = get_method_sig(root_method.val)
         docs1 = get_docs(root_method.val)
         if !isempty(docs1)
             docs = string(docs, "\n", docs1)
@@ -129,6 +128,26 @@ function get_methods(root_method, docs, fname, rootstore, methods, server)
         root_method = root_method.next
     end
     docs, methods
+end
+
+function get_method_sig(x::EXPR)
+    x = parentof(CSTParser.get_name(x))
+    args = []
+    kws = []
+    if x.head === :call
+        for i = 2:length(x.args)
+            if headof(x.args[i]) === :parameters
+                for p in x.args[i]
+                    b = get_binding_from_expr(p)
+                    b isa Binding && CSTParser.isidentifier(b.name) && push!(kws, Symbol(valof(b.val)))
+                end
+            else
+                b = get_binding_from_expr(x.args[i])
+                b isa Binding && CSTParser.isidentifier(b.name) && push!(args, Symbol(valof(b.name)) => FakeTypeName(VarRef(VarRef(nothing, :Core), :Any), []))
+            end
+        end
+    end
+    args, kws
 end
 
 function get_typevar_bounds(x::EXPR)
@@ -151,6 +170,17 @@ function get_datatype_params_fieldnames(x::EXPR)
         end
     end
     params, fns
+end
+
+function get_binding_from_expr(x::EXPR)
+    if hasbinding(x)
+        return bindingof(x)
+    end
+    for a in x
+        r = get_binding_from_expr(a)
+        r !== nothing && return r
+    end
+    return
 end
 
 end # module
