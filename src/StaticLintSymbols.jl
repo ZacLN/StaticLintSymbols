@@ -82,30 +82,35 @@ function symbols(expr::EXPR, server, pkg_name = CSTParser.get_name(expr).val, ro
                         rootstore[Symbol(n)] = symbols(v.val, server, n, ModuleStore(VarRef(rootstore.name, Symbol(name)), Dict(), get_docs(v.val), true, [], []))
                     end
                 elseif v.type == StaticLint.CoreTypes.Function || v.type == StaticLint.CoreTypes.DataType
-                    root_method = StaticLint.get_root_method(v, server)
-                    if root_method isa Binding
-                        if root_method.val isa EXPR
-                            fname = VarRef(rootstore.name, Symbol(n)) 
-                            extends = fname
-                            methods = MethodStore[]
-                            docs = get_docs(v.val)
-                            get_methods(root_method, docs, fname, rootstore, methods, server)
-                            if v.type == StaticLint.CoreTypes.DataType
-                                name = FakeTypeName(fname, [])
-                                super = FakeTypeName(VarRef(VarRef(nothing, :Core), :Any), [])
-                                types = []
-                                parameters, fieldnames = get_datatype_params_fieldnames(v.val)
-                                rootstore[Symbol(n)] = DataTypeStore(name, super, parameters, types, fieldnames, methods, docs, scope_exports(rootmodulescope, n))
-                            else
-                                rootstore[Symbol(n)] = FunctionStore(fname, methods, docs, extends, scope_exports(rootmodulescope, n))
+                    fname = VarRef(rootstore.name, Symbol(n)) 
+                    extends = fname
+                    methods = MethodStore[]
+                    docs = get_docs(v.val)
+                    for ref in v.refs 
+                        method = StaticLint.get_method(ref)
+                        if method !== nothing
+                            if method isa EXPR
+                                file, line = get_filename_line(method, server)
+                                sig, kws = get_method_sig(method)
+                                docs1 = get_docs(method)
+                                if !isempty(docs1)
+                                    docs = string(docs, "\n", docs1)
+                                end
+                                rt = VarRef(VarRef(nothing, :Core), :Any)
+                                push!(methods, MethodStore(fname.name, rootstore.name.name, file, line, sig, kws, rt))
                             end
-                        else
-                            @info "root_method.val isn't an EXPR"
                         end
+                    end
+                    if v.type == StaticLint.CoreTypes.DataType
+                        name = FakeTypeName(fname, [])
+                        super = FakeTypeName(VarRef(VarRef(nothing, :Core), :Any), [])
+                        parameters, fieldnames, types = scopeof(v.val) === nothing ? ([], [], []) : get_datatype_params_fieldnames(v.val)
+                        rootstore[Symbol(n)] = DataTypeStore(name, super, parameters, types, fieldnames, methods, docs, scope_exports(rootmodulescope, n))
                     else
-                        @info "root_method isn't a Binding"
+                        rootstore[Symbol(n)] = FunctionStore(fname, methods, docs, extends, scope_exports(rootmodulescope, n))
                     end
                 else
+                    n == "WS" && @info v.type
                     rootstore[Symbol(n)] = GenericStore(VarRef(rootstore.name, Symbol(n)), FakeTypeName(Any), get_docs(v.val), scope_exports(rootmodulescope, n))
                 end
             end
@@ -114,42 +119,37 @@ function symbols(expr::EXPR, server, pkg_name = CSTParser.get_name(expr).val, ro
     rootstore
 end
 
-function get_methods(root_method, docs, fname, rootstore, methods, server)
-    while root_method isa Binding
-        file, line = get_filename_line(root_method.val, server)
-        
-        sig, kws = get_method_sig(root_method.val)
-        docs1 = get_docs(root_method.val)
-        if !isempty(docs1)
-            docs = string(docs, "\n", docs1)
-        end
-        rt =VarRef(VarRef(nothing, :Core), :Any)
-        push!(methods, MethodStore(fname.name, rootstore.name.name, file, line, sig, kws, rt))
-        root_method = root_method.next
-    end
-    docs, methods
-end
-
 function get_method_sig(x::EXPR)
-    x = parentof(CSTParser.get_name(x))
     args = []
     kws = []
-    if x.head === :call
-        for i = 2:length(x.args)
-            if headof(x.args[i]) === :parameters
-                for p in x.args[i]
-                    b = get_binding_from_expr(p)
-                    b isa Binding && CSTParser.isidentifier(b.name) && push!(kws, Symbol(valof(b.val)))
+    if CSTParser.defines_function(x)
+        sig = CSTParser.rem_wheres_decls(CSTParser.get_sig(x))
+        if sig.head === :call
+            for i = 2:length(sig.args)
+                a = sig.args[i]
+                if headof(a) === :parameters
+                    for p in a.args
+                        b = get_binding_from_expr(p)
+                        b isa Binding && CSTParser.isidentifier(b.name) && push!(kws, Symbol(valof(b.val)))
+                    end
+                else
+                    # TODO: add multiple methods if we encounter kw args
+                    b = get_binding_from_expr(a)
+                    b isa Binding && CSTParser.isidentifier(b.name) && push!(args, Symbol(valof(b.name)) => get_type_from_binding(b))
                 end
-            else
-                b = get_binding_from_expr(x.args[i])
-                b isa Binding && CSTParser.isidentifier(b.name) && push!(args, Symbol(valof(b.name)) => FakeTypeName(VarRef(VarRef(nothing, :Core), :Any), []))
             end
         end
-    end
+    elseif CSTParser.defines_struct(x)
+        if !any(CSTParser.defines_function, x.args[3].args)
+            for a in x.args[3].args
+                b = get_binding_from_expr(a)
+                b isa Binding && CSTParser.isidentifier(b.name) && push!(args, Symbol(valof(b.name)) => get_type_from_binding(b))
+            end
+        end
+    end 
     args, kws
 end
-
+CSTParser.rem_wheres_decls
 function get_typevar_bounds(x::EXPR)
     # Just assumes `z <: Any` for now
     lb = FakeTypeofBottom()
@@ -161,15 +161,38 @@ function get_datatype_params_fieldnames(x::EXPR)
     sig = CSTParser.get_sig(x)
     params = []
     fns = []
+    fntypes = []
+    scopeof(x) === nothing && @info x
     for (n, b) in scopeof(x).names
         if StaticLint.is_in_fexpr(b.val, x-> x == sig)
             lb, ub = get_typevar_bounds(b.val)
             push!(params, FakeTypeVar(Symbol(n), lb, ub))
         else
             push!(fns, Symbol(n))
+            push!(fntypes, get_type_from_binding(b))
         end
     end
-    params, fns
+    params, fns, fntypes
+end
+
+function get_type_from_binding(b)
+    if b.type isa SymbolServer.DataTypeStore
+        b.type.name
+    elseif b.type isa Binding && b.type.val isa EXPR
+        FakeTypeName(getVarRef(b.type), [])
+    elseif b.type isa Binding && b.type.val isa SymbolServer.DataTypeStore
+        b.type.val.name
+    else
+        FakeTypeName(VarRef(VarRef(nothing, :Core), :Any), [])
+    end
+end
+
+function getVarRef(b::Binding, s = StaticLint.retrieve_scope(b.val), names = [Symbol(valof(b.name))])
+    s.parent === nothing && return reduce((a,b) -> VarRef(a,b), reverse(names), init = nothing)
+    if CSTParser.defines_module(s.expr)
+        push!(names, Symbol(valof(CSTParser.get_name(s.expr))))
+    end
+    return getVarRef(b, StaticLint.retrieve_toplevel_scope(s.parent), names)
 end
 
 function get_binding_from_expr(x::EXPR)
@@ -182,5 +205,23 @@ function get_binding_from_expr(x::EXPR)
     end
     return
 end
+
+
+function comp(d1::ModuleStore, d2::ModuleStore)
+    for k in union(keys(d1.vals), keys(d1.vals))
+        if haskey(d1.vals, k) && haskey(d2.vals, k)
+            comp(d1[k], d2[k]) || @info "Generic store $(d1.name).$k"
+        elseif startswith(String(k), "#")
+        elseif !haskey(d2.vals, k)
+            # @info "d2 missing $(d1.name).$k"
+        end
+    end
+    true
+end
+function comp(d1::GenericStore, d2::GenericStore)
+    d1.name == d2.name && d1.doc == d2.doc && d1.typ == d2.typ && d1.exported == d2.exported
+end
+
+comp(d1, d2) = true
 
 end # module
