@@ -1,7 +1,7 @@
 name = "StaticLintSymbols"
 uuid = "344e3e78-578f-4441-858c-704373253f8d"
 authors = ["Zac Nugent <zac.nugent@gmail.com>"]
-version = "0.1.0"
+version = "1.0.0"
 
 [deps]
 CSTParser = "00ebfdb7-1f24-5e51-bd34-a7502290713f"
